@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Derive version
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "FRACTALKVS_PACKAGE_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Restore and build
+        run: |
+          dotnet restore FractalKVS.csproj
+          dotnet build FractalKVS.csproj --configuration Release --no-restore
+
+      - name: Pack
+        run: dotnet pack FractalKVS.csproj --configuration Release --no-build --output artifacts/packages /p:PackageVersion=${{ env.FRACTALKVS_PACKAGE_VERSION }}
+
+      - name: Create checksums
+        shell: bash
+        run: |
+          cd artifacts/packages
+          sha256sum *.nupkg *.snupkg > SHA256SUMS.txt
+
+      - name: Attest package provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: artifacts/packages/*.nupkg
+
+      - name: Authenticate to NuGet.org through trusted publishing
+        uses: NuGet/login@v1
+        id: nuget-login
+        with:
+          user: iqueue
+
+      - name: Publish NuGet package
+        run: dotnet nuget push artifacts/packages/*.nupkg --api-key ${{ steps.nuget-login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" artifacts/packages/* --generate-notes --verify-tag
