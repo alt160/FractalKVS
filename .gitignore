@@ -1,0 +1,8 @@
+[Bb]in/
+[Oo]bj/
+artifacts/
+.code-history/
+.vshistory/
+.vs/
+*.user
+*.suo
