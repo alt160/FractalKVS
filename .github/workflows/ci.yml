@@ -1,0 +1,27 @@
+name: Validate source layout
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        dotnet: [8, 9, 10]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ matrix.dotnet }}.0.x
+      - name: Build and pack without publishing
+        run: |
+          dotnet build FractalKVS.csproj --configuration Release /p:TreatWarningsAsErrors=true
+          dotnet pack FractalKVS.csproj --configuration Release --no-build --no-restore --output artifacts/packages
