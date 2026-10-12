@@ -41,7 +41,8 @@ jobs:
         shell: pwsh
         run: |
           [xml] $project = Get-Content FractalKVS.csproj -Raw
-          if ([string] $project.Project.PropertyGroup.PackageVersion -cne $env:FRACTALKVS_PACKAGE_VERSION) {
+          $projectVersion = $project.SelectSingleNode('/Project/PropertyGroup/PackageVersion').InnerText
+          if ($projectVersion -cne $env:FRACTALKVS_PACKAGE_VERSION) {
             throw 'The immutable source tag and project package version differ.'
           }
 
