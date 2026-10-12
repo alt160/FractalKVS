@@ -8,17 +8,18 @@ permissions:
   contents: write
   id-token: write
   attestations: write
+  artifact-metadata: write
 
 jobs:
   release:
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
 
@@ -36,11 +37,21 @@ jobs:
       - name: Pack
         run: dotnet pack FractalKVS.csproj --configuration Release --no-build --output artifacts/packages /p:PackageVersion=${{ env.FRACTALKVS_PACKAGE_VERSION }}
 
-      - name: Create checksums
-        shell: bash
+      - name: Smoke test package consumer
         run: |
-          cd artifacts/packages
-          sha256sum *.nupkg *.snupkg > SHA256SUMS.txt
+          dotnet restore tests/FractalKVS.PackageSmoke/FractalKVS.PackageSmoke.csproj /p:RestoreAdditionalProjectSources=artifacts/packages /p:FractalKVSPackageVersion=${{ env.FRACTALKVS_PACKAGE_VERSION }}
+          dotnet run --project tests/FractalKVS.PackageSmoke/FractalKVS.PackageSmoke.csproj --configuration Release --no-restore /p:FractalKVSPackageVersion=${{ env.FRACTALKVS_PACKAGE_VERSION }}
+
+      - name: Create precompiled library archive and checksums
+        shell: pwsh
+        run: |
+          $stage = 'artifacts/precompiled'
+          New-Item -ItemType Directory -Path $stage -ErrorAction Stop | Out-Null
+          Copy-Item bin/Release/net8.0/FractalKVS.dll,bin/Release/net8.0/FractalKVS.xml,bin/Release/net8.0/FractalKVS.pdb,README.md,LICENSE,CHANGELOG.md -Destination $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "artifacts/packages/FractalKVS-$env:FRACTALKVS_PACKAGE_VERSION-net8.0.zip"
+          Get-ChildItem artifacts/packages -File | Where-Object Extension -In '.nupkg','.snupkg','.zip' | Sort-Object Name | ForEach-Object {
+            (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() + '  ' + $_.Name
+          } | Set-Content artifacts/packages/SHA256SUMS.txt -Encoding utf8NoBOM
 
       - name: Attest package provenance
         uses: actions/attest@v4

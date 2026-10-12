@@ -25,3 +25,7 @@ jobs:
         run: |
           dotnet build FractalKVS.csproj --configuration Release /p:TreatWarningsAsErrors=true
           dotnet pack FractalKVS.csproj --configuration Release --no-build --no-restore --output artifacts/packages
+      - name: Verify package-only reads, writes, rebuild and reopen
+        run: |
+          dotnet build tests/FractalKVS.PackageSmoke/FractalKVS.PackageSmoke.csproj --configuration Release /p:SmokeFramework=net${{ matrix.dotnet }}.0 /p:RestoreAdditionalProjectSources=${{ github.workspace }}/artifacts/packages /p:TreatWarningsAsErrors=true
+          dotnet tests/FractalKVS.PackageSmoke/bin/Release/net${{ matrix.dotnet }}.0/FractalKVS.PackageSmoke.dll

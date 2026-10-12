@@ -855,157 +855,28 @@ namespace FractalKVS
         }
 
         /// <summary>
-        /// Rebuilds the Fractal index file from the current data file and swaps it in place.<br/>
-        /// This is an offline operation and requires exclusive access; callers must gate concurrent writers.<br/>
-        /// The rebuild creates a minimal root-tier-only index (no expansions) and preserves the existing atomic SHM state.<br/>
+        /// Reconstructs the reachable routing of a healthy, open Fractal index and replaces only its index file.<br/>
+        /// Preserves native tiers, back-references, A/B selections, data offsets, store identity and durable atomic state; payloads are not rewritten.<br/>
+        /// This is offline maintenance: callers must exclude readers and other processes; this instance drains and excludes mutations for the operation.<br/>
+        /// The original is retained until replacement reopening and exact routing/state validation succeed, and is restored on a replacement failure.<br/>
+        /// Requires the existing authoritative index and does not recover missing or corrupt index files from physical data records.<br/>
         /// </summary>
         public void RebuildIndex()
         {
-            using var mutation = EnterMutationScope();
+            var resumeOnlineDefrag = IsOnlineDefragRunning;
             StopOnlineDefrag();
-
-            var indexPath = Path.Combine(folderPath, $"{name}.fractX");
-            var tempPath = indexPath + ".rebuild";
-            var tempShmPath = tempPath + ".shm";
-            var backupPath = indexPath + ".bak";
-
-            if (File.Exists(tempPath))
-                File.Delete(tempPath);
-            if (File.Exists(tempShmPath))
-                File.Delete(tempShmPath);
-
-            var newIndex = FIndex.CreateForPath(tempPath, config);
-            newIndex.Init();
-            newIndex.fc.BucketTelemetry = telemetry?.BucketTelemetry;
-            BuildRootIndexFromData(newIndex);
-
-            newIndex.fc.FlushToDisk();
-            newIndex.fc.Close();
-            try { newIndex.fc.atomics.Dispose(); } catch { }
-
-            // Close current index handles so we can swap files.
-            fIndex.fc.Close();
-
-            var swapped = false;
             try
             {
-                if (File.Exists(backupPath))
-                    File.Delete(backupPath);
-
-                if (File.Exists(indexPath))
-                    File.Move(indexPath, backupPath, overwrite: true);
-
-                File.Move(tempPath, indexPath, overwrite: true);
-                swapped = true;
+                using var exclusive = EnterSnapshotExclusiveScope(CancellationToken.None);
+                RebuildHealthyIndex();
             }
             finally
             {
-                if (!swapped)
-                {
-                    if (File.Exists(backupPath) && !File.Exists(indexPath))
-                        File.Move(backupPath, indexPath, overwrite: true);
-                }
-                else
-                {
-                    if (File.Exists(backupPath))
-                        File.Delete(backupPath);
-                }
-
-                if (File.Exists(tempPath))
-                    File.Delete(tempPath);
-                if (File.Exists(tempShmPath))
-                    File.Delete(tempShmPath);
-            }
-
-            fIndex = new FIndex(folderPath, name, config);
-            fIndex.Init();
-
-            if (telemetry is not null)
-            {
-                telemetry.IndexFileSyscallsInternal = fIndex.fc.syscallPerfTracker;
-                fIndex.fc.BucketTelemetry = telemetry.BucketTelemetry;
+                if (resumeOnlineDefrag && !fIndex.fc.IsDisposed)
+                    StartOnlineDefrag();
             }
         }
 
-        /// <summary>
-        /// Builds a minimal root-tier-only index using the current data file's collision chains.<br/>
-        /// Only bucket heads are indexed; no tier expansions are created during rebuild.<br/>
-        /// </summary>
-        /// <param name="targetIndex">The target index instance to populate.<br/></param>
-        private void BuildRootIndexFromData(FIndex targetIndex)
-        {
-            ArgumentNullException.ThrowIfNull(targetIndex);
-
-            var fileEnd = (ulong)fData.fc.Length;
-            var start = fData.header.FirstRecordOffset;
-            if (start == 0 || start >= fileEnd)
-                return;
-
-            var headers = new Dictionary<ulong, RecordHeader>();
-            var referenced = new HashSet<ulong>();
-
-            ulong offset = start;
-            while (offset + (uint)RecordHeader.SizeOf <= fileEnd)
-            {
-                var header = fData.ReadRecordHeader(offset);
-                if (header.RecordSize == 0)
-                    break;
-
-                headers[offset] = header;
-
-                if (header.NextRecordOffset != 0)
-                    referenced.Add(header.NextRecordOffset);
-
-                offset += header.RecordSize;
-            }
-
-
-
-
-            uint rootCount = targetIndex.Header.RootBucketCount;
-            ulong mask = rootCount - 1;
-
-            foreach (var kvp in headers)
-            {
-                var headOffset = kvp.Key;
-                var headHeader = kvp.Value;
-
-                if (referenced.Contains(headOffset))
-                    continue;
-
-                // Find any non-zero record ID in the chain so we can compute the bucket index.
-                ulong id = 0;
-                ulong current = headOffset;
-                while (current != 0 && headers.TryGetValue(current, out var h))
-                {
-                    if (h.ID != 0)
-                    {
-                        id = h.ID;
-                        break;
-                    }
-                    current = h.NextRecordOffset;
-                }
-
-                if (id == 0)
-                    continue;
-
-                ulong bucketIndex = FIndex.HashRecordID(id) & mask;
-
-                var entry = new BucketEntry
-                {
-                    OffsetA = headOffset,
-                    SizeA = headHeader.DataLength,
-                    OffsetB = 0,
-                    SizeB = 0
-                };
-                entry.ABReadSelector = BucketEntrySelector.A;
-                entry.IsExpanded = false;
-                entry.IsChainedBackref = false;
-                entry.HasSingleRecord = headHeader.NextRecordOffset == 0;
-
-                targetIndex.TrySetRootEntryIfUnset(bucketIndex, entry);
-            }
-        }
         /// <summary>
         /// Counts all deleted (tombstoned) records that still occupy space within live bucket chains.
         /// </summary>
@@ -4524,6 +4395,166 @@ namespace FractalKVS
                 if (!hasCurrent)
                     throw new InvalidOperationException("The pooled record block is not positioned on a record.");
             }
+        }
+        /// <summary>
+        /// Optional internal maintenance-only diagnostic checkpoint for deterministic replacement failure tests.<br/>
+        /// Never invoked by ordinary record reads, writes or queries, and not part of the public application surface.<br/>
+        /// </summary>
+        internal Action<string>? IndexRebuildCheckpoint { get; set; }
+
+        /// <summary>
+        /// Builds, validates, replaces and reopens the healthy index under the caller's exclusive maintenance lease.<br/>
+        /// Keeps the original atomic map alive through replacement and rollback so persisted allocator/USN lanes are not reset.<br/>
+        /// Unique operation-owned filenames avoid deleting a prior failure's recovery image.<br/>
+        /// </summary>
+        private void RebuildHealthyIndex()
+        {
+            var original = fIndex;
+            original.fc.FlushToDisk();
+            original.fc.atomics.Flush(flushToDisk: true);
+            int[] slots = CreatePersistedIndexAtomicSlotList();
+            long[] values = new long[slots.Length - 1];
+            for (int i = 1; i < slots.Length; i++)
+                values[i - 1] = original.fc.atomics.Read64(slots[i]);
+
+            string indexPath = Path.Combine(folderPath, name + ".fractX");
+            string operation = Guid.NewGuid().ToString("N");
+            string tempPath = indexPath + ".rebuild-" + operation;
+            string backupPath = indexPath + ".rebuild-backup-" + operation;
+            string failedPath = tempPath + ".failed";
+            FIndex? image = null;
+            FIndex? replacement = null;
+            bool originalClosed = false;
+            bool cleanupAllowed = true;
+            try
+            {
+                image = FIndex.CreateForPath(tempPath, config);
+                var offsets = original.BuildMaintenanceImage(image);
+                image.PrepareReplacementOwnership(indexPath);
+                image.fc.FlushToDisk();
+                IndexRebuildCheckpoint?.Invoke("after-build");
+                original.ValidateMaintenanceImage(image, offsets, indexPath);
+                image.ReleaseMaintenanceResources();
+                image = null;
+
+                originalClosed = true;
+                original.fc.Dispose();
+                // Same-volume replacement retains the original before the candidate is reopened.
+                File.Replace(tempPath, indexPath, backupPath);
+                IndexRebuildCheckpoint?.Invoke("after-replacement");
+                replacement = OpenMaintenanceIndex();
+                IndexRebuildCheckpoint?.Invoke("after-reopen");
+                original.ValidateMaintenanceImage(replacement, offsets, backupPath);
+                ValidateRebuildAtomicState(replacement, slots, values);
+                AttachMaintenanceIndex(replacement);
+                replacement = null;
+            }
+            catch (Exception failure)
+            {
+                try
+                {
+                    replacement?.ReleaseMaintenanceResources();
+                    replacement = null;
+                    if (originalClosed)
+                    {
+                        if (File.Exists(backupPath))
+                        {
+                            if (File.Exists(indexPath))
+                                File.Replace(backupPath, indexPath, failedPath);
+                            else
+                                File.Move(backupPath, indexPath);
+                        }
+                        for (int i = 1; i < slots.Length; i++)
+                            original.fc.atomics.Write64(slots[i], values[i - 1]);
+                        original.fc.atomics.Flush(flushToDisk: true);
+                        replacement = OpenMaintenanceIndex();
+                        ValidateRebuildAtomicState(replacement, slots, values);
+                        AttachMaintenanceIndex(replacement);
+                        replacement = null;
+                    }
+                }
+                catch (Exception rollbackFailure)
+                {
+                    cleanupAllowed = false;
+                    throw new AggregateException(
+                        $"Index maintenance and rollback failed. Retained recovery paths: '{backupPath}', '{tempPath}', '{failedPath}'. Close the store before recovery.",
+                        failure, rollbackFailure);
+                }
+                throw;
+            }
+            finally
+            {
+                if (image is not null)
+                    TryReleaseMaintenanceIndex(image);
+                if (replacement is not null)
+                    TryReleaseMaintenanceIndex(replacement);
+                if (originalClosed)
+                    TryReleaseMaintenanceIndex(original);
+                if (cleanupAllowed)
+                {
+                    TryDeleteMaintenanceFile(tempPath);
+                    TryDeleteMaintenanceFile(tempPath + ".shm");
+                    TryDeleteMaintenanceFile(failedPath);
+                    TryDeleteMaintenanceFile(backupPath);
+                }
+            }
+        }
+
+        /// <summary>Opens an existing authoritative index path and closes every acquired resource if initialization fails.<br/></summary>
+        /// <returns>An initialized index, without creating a missing replacement file.<br/></returns>
+        private FIndex OpenMaintenanceIndex()
+        {
+            var reopened = new FIndex(folderPath, name, config with { CreateIfNotExists = false });
+            try
+            {
+                reopened.Init();
+                return reopened;
+            }
+            catch
+            {
+                TryReleaseMaintenanceIndex(reopened);
+                throw;
+            }
+        }
+
+        /// <summary>Verifies every durable non-EOF atomic lane after reopening without changing allocator or store update state.<br/></summary>
+        /// <param name="index">Reopened replacement or restored original.<br/></param>
+        /// <param name="slots">Existing persisted slot contract, with EOF at ordinal zero.<br/></param>
+        /// <param name="values">Pre-maintenance non-EOF lane values.<br/></param>
+        private static void ValidateRebuildAtomicState(FIndex index, int[] slots, long[] values)
+        {
+            for (int i = 1; i < slots.Length; i++)
+                if (index.fc.atomics.Read64(slots[i]) != values[i - 1])
+                    throw new InvalidDataException("Index maintenance changed durable allocator or store update state.");
+        }
+
+        /// <summary>Installs a validated open index and reattaches existing store-scoped telemetry to its new controller.<br/></summary>
+        /// <param name="index">Successful replacement or successfully restored original.<br/></param>
+        private void AttachMaintenanceIndex(FIndex index)
+        {
+            if (telemetry is not null)
+            {
+                telemetry.IndexFileSyscallsInternal = index.fc.syscallPerfTracker;
+                index.fc.BucketTelemetry = telemetry.BucketTelemetry;
+            }
+            fIndex = index;
+        }
+
+        /// <summary>Releases only an obsolete maintenance image; cleanup errors cannot mask the primary failure or undo a validated replacement.<br/></summary>
+        /// <param name="index">An unpublished, retired or failed image, never the installed live index.<br/></param>
+        private static void TryReleaseMaintenanceIndex(FIndex index)
+        {
+            try { index.ReleaseMaintenanceResources(); }
+            catch (Exception error) { Debug.WriteLine($"Fractal maintenance resource cleanup: {error.Message}"); }
+        }
+
+        /// <summary>Deletes one exact operation-owned maintenance artifact after success or completed rollback; leaves it recoverable when cleanup fails.<br/></summary>
+        /// <param name="path">A unique temporary or backup path created by this rebuild invocation.<br/></param>
+        private static void TryDeleteMaintenanceFile(string path)
+        {
+            try { if (File.Exists(path)) File.Delete(path); }
+            catch (IOException error) { Debug.WriteLine($"Fractal maintenance retained '{path}': {error.Message}"); }
+            catch (UnauthorizedAccessException error) { Debug.WriteLine($"Fractal maintenance retained '{path}': {error.Message}"); }
         }
     }
 

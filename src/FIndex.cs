@@ -915,11 +915,13 @@ namespace FractalKVS
         }
 
         /// <summary>
-        /// Rewrites the header's stored file name and directory path to the current file location without moving any buckets.<br/>
-        /// Use after intentionally moving or copying the index file while the store is offline.<br/>
+        /// Rewrites the header's stored file name and directory path without moving any buckets.<br/>
+        /// Called only for explicit offline ownership adoption or a prepared same-directory replacement.<br/>
         /// Throws if the new UTF-8 path or name cannot fit inside the reserved header space.<br/>
         /// </summary>
-        public void TakeOwnership()
+        /// <param name="curPath">Validated ownership directory to persist.<br/></param>
+        /// <param name="curName">Validated ownership filename to persist.<br/></param>
+        private void RewriteOwnership(string curPath, string curName)
         {
             if (fc.Length < FIndexHeader.SizeOf)
                 throw new System.IO.InvalidDataException($"File '{fc.FullName}' is corrupted or incomplete. Cannot take ownership.");
@@ -942,9 +944,6 @@ namespace FractalKVS
                 throw new System.IO.InvalidDataException($"File '{fc.FullName}' is corrupted or incomplete  Cannot take ownership.");
             if (newHeader.FilePathOffset < newHeader.FileNameOffset + newHeader.FileNameLength || newHeader.FilePathLength == 0)
                 throw new System.IO.InvalidDataException($"File '{fc.FullName}' is corrupted or incomplete  Cannot take ownership.");
-
-            string curPath = fc.DirectoryName;
-            string curName = fc.Name;
 
             int newNameBytes = Encoding.UTF8.GetByteCount(curName);
             int newPathBytes = Encoding.UTF8.GetByteCount(curPath);
@@ -1394,6 +1393,307 @@ namespace FractalKVS
                 .ToArray();
 
             return new BucketStructureSnapshot(perTierOrdered, hottest, coolest);
+        }
+
+        /// <summary>
+        /// Adopts the controller's current file location after an intentional offline move or copy.<br/>
+        /// Reuses strict magic/checksum/offset/space validation and changes only ownership metadata, not buckets or UUID.<br/>
+        /// </summary>
+        public void TakeOwnership() => RewriteOwnership(fc.DirectoryName, fc.Name);
+
+        /// <summary>
+        /// Records the intended final ownership of an unpublished same-directory replacement index before swapping it in.<br/>
+        /// The caller must have initialized and built the temporary image and must publish it at exactly this path.<br/>
+        /// Existing live storage is not touched, and ordinary Init retains its strict moved/copied-file rejection.<br/>
+        /// </summary>
+        /// <param name="replacementPath">Final index path in the temporary controller's existing directory.<br/></param>
+        /// <exception cref="ArgumentException">The path is blank or names a different directory.<br/></exception>
+        /// <exception cref="InvalidDataException">The temporary image's ownership header is invalid.<br/></exception>
+        /// <exception cref="InvalidOperationException">The final name/path cannot fit the existing header reservation.<br/></exception>
+        internal void PrepareReplacementOwnership(string replacementPath)
+        {
+            if (string.IsNullOrWhiteSpace(replacementPath))
+                throw new ArgumentException("A replacement path is required.", nameof(replacementPath));
+            string fullPath = Path.GetFullPath(replacementPath);
+            string directory = Path.GetDirectoryName(fullPath)!;
+            if (!string.Equals(Path.TrimEndingDirectorySeparator(directory),
+                    Path.TrimEndingDirectorySeparator(Path.GetFullPath(fc.DirectoryName)), StringComparison.OrdinalIgnoreCase))
+                throw new ArgumentException("The replacement must remain in the existing index directory.", nameof(replacementPath));
+            RewriteOwnership(directory, Path.GetFileName(fullPath));
+        }
+
+        /// <summary>
+        /// Reconstructs only the reachable routing tiers of this initialized, exclusively held index into an unpublished image.<br/>
+        /// The original header reservation, bucket ordinals, leaf A/B slots, selectors and back-references are preserved; only selected expanded-tier offsets are relocated.<br/>
+        /// Uses fixed pooled entry blocks and bookkeeping proportional to reachable tiers, never to physical records or payload bytes.<br/>
+        /// This is healthy-index maintenance, not recovery from missing or corrupt index storage.<br/>
+        /// </summary>
+        /// <param name="target">A distinct, newly created maintenance controller that has not been initialized.<br/></param>
+        /// <returns>The original-to-replacement tier-offset map used for exact pre-publication and reopened-image validation.<br/></returns>
+        internal Dictionary<ulong, ulong> BuildMaintenanceImage(FIndex target)
+        {
+            ArgumentNullException.ThrowIfNull(target);
+            if (ReferenceEquals(this, target) || !target.fc.IsNew)
+                throw new InvalidOperationException("A maintenance rebuild requires a distinct new index image.");
+
+            const int blockSize = 24 * 2048;
+            byte[] rented = ArrayPool<byte>.Shared.Rent(blockSize);
+            try
+            {
+                ulong sourceLength = checked((ulong)fc.FileLength);
+                var rootHeader = ReadMaintenanceTierHeader(header.RootBucketOffset, 0, sourceLength);
+                if (rootHeader.BucketCount != header.RootBucketCount)
+                    throw new InvalidDataException("The root tier does not match its index header.");
+
+                var offsets = new Dictionary<ulong, ulong> { [header.RootBucketOffset] = header.RootBucketOffset };
+                var tiers = new List<(ulong Source, ulong Destination, BucketTierHeader Header)>
+                    { (header.RootBucketOffset, header.RootBucketOffset, rootHeader) };
+                ulong end = checked(header.RootBucketOffset + MaintenanceTierLength(rootHeader));
+                Span<byte> anchorBytes = stackalloc byte[(int)BucketEntry.SizeOf];
+                for (int tierIndex = 0; tierIndex < tiers.Count; tierIndex++)
+                {
+                    var tier = tiers[tierIndex];
+                    for (uint first = 0; first < tier.Header.BucketCount;)
+                    {
+                        int count = (int)Math.Min(2048u, tier.Header.BucketCount - first);
+                        var block = rented.AsSpan(0, count * (int)BucketEntry.SizeOf);
+                        ReadMaintenanceExactly(fc, block, tier.Source + BucketTierHeader.SizeOf + first * (ulong)BucketEntry.SizeOf);
+                        foreach (ref readonly var entry in MemoryMarshal.Cast<byte, BucketEntry>(block))
+                        {
+                            if (entry.IsUnset)
+                                continue;
+                            if (entry.IsChainedBackref)
+                            {
+                                if (entry.IsExpanded || entry.OffsetA >= tier.Header.BucketCount)
+                                    throw new InvalidDataException("Invalid maintenance back-reference.");
+                                ReadMaintenanceExactly(fc, anchorBytes, tier.Source + BucketTierHeader.SizeOf + entry.OffsetA * BucketEntry.SizeOf);
+                                var anchor = MemoryMarshal.Read<BucketEntry>(anchorBytes);
+                                // Deleting the last member can legitimately leave aliases to an unset anchor.
+                                if (anchor.IsChainedBackref)
+                                    throw new InvalidDataException("A maintenance back-reference points to another back-reference.");
+                                continue;
+                            }
+                            if (entry.RecordOffset == 0)
+                                throw new InvalidDataException("A populated maintenance bucket has no selected location.");
+                            if (!entry.IsExpanded)
+                                continue;
+
+                            ulong childOffset = entry.RecordOffset;
+                            if (offsets.ContainsKey(childOffset))
+                                throw new InvalidDataException("Cyclic or multiply owned index tiers cannot be rebuilt.");
+                            var child = ReadMaintenanceTierHeader(childOffset, checked((ushort)(tier.Header.Tier + 1)), sourceLength);
+                            if (end > OFFSET_MASK)
+                                throw new InvalidDataException("The reconstructed index exceeds its offset representation.");
+                            offsets.Add(childOffset, end);
+                            tiers.Add((childOffset, end, child));
+                            end = checked(end + MaintenanceTierLength(child));
+                        }
+                        first += (uint)count;
+                    }
+                }
+
+                ulong previousEnd = header.RootBucketOffset;
+                foreach (var tier in tiers.OrderBy(item => item.Source))
+                {
+                    if (tier.Source < previousEnd)
+                        throw new InvalidDataException("Reachable index tiers overlap.");
+                    previousEnd = checked(tier.Source + MaintenanceTierLength(tier.Header));
+                }
+
+                target.fc.SetLength(end);
+                for (ulong position = 0; position < header.RootBucketOffset;)
+                {
+                    int length = (int)Math.Min((ulong)blockSize, header.RootBucketOffset - position);
+                    var block = rented.AsSpan(0, length);
+                    ReadMaintenanceExactly(fc, block, position);
+                    target.fc.Write(block, position);
+                    position += (uint)length;
+                }
+                foreach (var tier in tiers)
+                {
+                    var tierHeader = tier.Header;
+                    target.fc.Write(MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref tierHeader, 1)), tier.Destination);
+                    for (uint first = 0; first < tier.Header.BucketCount;)
+                    {
+                        int count = (int)Math.Min(2048u, tier.Header.BucketCount - first);
+                        var block = rented.AsSpan(0, count * (int)BucketEntry.SizeOf);
+                        ulong relative = BucketTierHeader.SizeOf + first * (ulong)BucketEntry.SizeOf;
+                        ReadMaintenanceExactly(fc, block, tier.Source + relative);
+                        RelocateMaintenanceEntries(block, offsets);
+                        target.fc.Write(block, tier.Destination + relative);
+                        first += (uint)count;
+                    }
+                }
+                target.header = header;
+                return offsets;
+            }
+            finally { ArrayPool<byte>.Shared.Return(rented); }
+        }
+
+        /// <summary>
+        /// Proves byte-for-byte routing equivalence against the retained original file, allowing only mapped selected child-tier locations to differ.<br/>
+        /// The original may be the live pathname before publication or the rollback pathname after replacement; it is opened read-only without creating an atomic sidecar.<br/>
+        /// Fixed pooled blocks avoid loading the entire index or materializing a record identity set.<br/>
+        /// </summary>
+        /// <param name="replacement">Unpublished or successfully initialized replacement whose controller is open.<br/></param>
+        /// <param name="offsets">Complete tier relocation map produced by BuildMaintenanceImage.<br/></param>
+        /// <param name="originalPath">Exact retained original file used as the comparison authority.<br/></param>
+        internal void ValidateMaintenanceImage(FIndex replacement, IReadOnlyDictionary<ulong, ulong> offsets, string originalPath)
+        {
+            const int blockSize = 24 * 2048;
+            byte[] sourceBytes = ArrayPool<byte>.Shared.Rent(blockSize);
+            byte[]? targetBytes = null;
+            try
+            {
+                targetBytes = ArrayPool<byte>.Shared.Rent(blockSize);
+                using var source = new FileStream(originalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                for (ulong position = 0; position < header.RootBucketOffset;)
+                {
+                    int length = (int)Math.Min((ulong)blockSize, header.RootBucketOffset - position);
+                    var expected = sourceBytes.AsSpan(0, length);
+                    var actual = targetBytes.AsSpan(0, length);
+                    source.Position = checked((long)position);
+                    source.ReadExactly(expected);
+                    ReadMaintenanceExactly(replacement.fc, actual, position);
+                    if (!expected.SequenceEqual(actual))
+                        throw new InvalidDataException("The maintenance replacement changed index identity or header metadata.");
+                    position += (uint)length;
+                }
+
+                ulong expectedEnd = header.RootBucketOffset;
+                foreach (var pair in offsets)
+                {
+                    var expectedHeader = sourceBytes.AsSpan(0, (int)BucketTierHeader.SizeOf);
+                    var actualHeader = targetBytes.AsSpan(0, (int)BucketTierHeader.SizeOf);
+                    source.Position = checked((long)pair.Key);
+                    source.ReadExactly(expectedHeader);
+                    ReadMaintenanceExactly(replacement.fc, actualHeader, pair.Value);
+                    if (!expectedHeader.SequenceEqual(actualHeader))
+                        throw new InvalidDataException("The maintenance replacement changed a tier header.");
+                    var tier = MemoryMarshal.Read<BucketTierHeader>(expectedHeader);
+                    expectedEnd = Math.Max(expectedEnd, checked(pair.Value + MaintenanceTierLength(tier)));
+                    for (uint first = 0; first < tier.BucketCount;)
+                    {
+                        int count = (int)Math.Min(2048u, tier.BucketCount - first);
+                        var expected = sourceBytes.AsSpan(0, count * (int)BucketEntry.SizeOf);
+                        var actual = targetBytes.AsSpan(0, expected.Length);
+                        ulong relative = BucketTierHeader.SizeOf + first * (ulong)BucketEntry.SizeOf;
+                        source.Position = checked((long)(pair.Key + relative));
+                        source.ReadExactly(expected);
+                        RelocateMaintenanceEntries(expected, offsets);
+                        ReadMaintenanceExactly(replacement.fc, actual, pair.Value + relative);
+                        if (!expected.SequenceEqual(actual))
+                            throw new InvalidDataException("The maintenance replacement changed routing, A/B selection or record locations.");
+                        first += (uint)count;
+                    }
+                }
+                if (checked((ulong)replacement.fc.FileLength) != expectedEnd)
+                    throw new InvalidDataException("The maintenance replacement has an unexpected physical length.");
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(sourceBytes);
+                if (targetBytes is not null)
+                    ArrayPool<byte>.Shared.Return(targetBytes);
+            }
+        }
+
+        /// <summary>Reads and validates one source tier before allocating or following its routing entries.<br/></summary>
+        /// <param name="offset">Source tier location, outside the ownership reservation.<br/></param>
+        /// <param name="level">Required child depth, or zero for the root.<br/></param>
+        /// <param name="fileLength">Stable source physical EOF under exclusive maintenance.<br/></param>
+        /// <returns>A bounded, power-of-two tier header at the required depth.<br/></returns>
+        private BucketTierHeader ReadMaintenanceTierHeader(ulong offset, ushort level, ulong fileLength)
+        {
+            if (offset < header.RootBucketOffset || offset > fileLength || fileLength - offset < BucketTierHeader.SizeOf)
+                throw new InvalidDataException("A maintenance tier header is outside the index file.");
+            Span<byte> bytes = stackalloc byte[(int)BucketTierHeader.SizeOf];
+            ReadMaintenanceExactly(fc, bytes, offset);
+            var tier = MemoryMarshal.Read<BucketTierHeader>(bytes);
+            ulong length = MaintenanceTierLength(tier);
+            if (tier.Tier != level || tier.BucketCount == 0 || !BitOperations.IsPow2(tier.BucketCount) ||
+                length > int.MaxValue || length > fileLength - offset)
+                throw new InvalidDataException("Invalid maintenance tier depth, count or physical bounds.");
+            return tier;
+        }
+
+        /// <summary>Computes the existing packed tier extent without overflowing 32-bit bucket arithmetic.<br/></summary>
+        /// <param name="tier">Persisted tier header.<br/></param><returns>Header plus all packed bucket bytes.<br/></returns>
+        private static ulong MaintenanceTierLength(in BucketTierHeader tier)
+            => checked(BucketTierHeader.SizeOf + tier.BucketCount * (ulong)BucketEntry.SizeOf);
+
+        /// <summary>
+        /// Relocates only the selected pointer of expanded entries; ordinary data locations and back-reference ordinals are never rewritten.<br/>
+        /// Updating the raw lane with the inverse offset mask preserves every flag bit, including the expanded marker.<br/>
+        /// </summary>
+        /// <param name="bytes">Whole packed bucket entries in a reusable maintenance block.<br/></param>
+        /// <param name="offsets">Complete original-to-replacement reachable-tier map.<br/></param>
+        private static void RelocateMaintenanceEntries(Span<byte> bytes, IReadOnlyDictionary<ulong, ulong> offsets)
+        {
+            for (int position = 0; position < bytes.Length; position += (int)BucketEntry.SizeOf)
+            {
+                var entryBytes = bytes.Slice(position, (int)BucketEntry.SizeOf);
+                var entry = MemoryMarshal.Read<BucketEntry>(entryBytes);
+                if (!entry.IsExpanded || entry.IsChainedBackref)
+                    continue;
+                if (!offsets.TryGetValue(entry.RecordOffset, out ulong relocated))
+                    throw new InvalidDataException("A maintenance child tier is absent from the relocation map.");
+                var lane = entryBytes.Slice(entry.ABReadSelector == BucketEntrySelector.A ? 0 : sizeof(ulong), sizeof(ulong));
+                ulong raw = (MemoryMarshal.Read<ulong>(lane) & ~OFFSET_MASK) | relocated;
+                MemoryMarshal.Write(lane, in raw);
+            }
+        }
+
+        /// <summary>
+        /// Releases an unpublished, retired or failed maintenance image and its exclusively owned tier buffers.<br/>
+        /// Must never be called on the installed live index or while a reader still borrows one of its tiers.<br/>
+        /// </summary>
+        internal void ReleaseMaintenanceResources()
+        {
+            try { fc.Dispose(); }
+            finally
+            {
+                try
+                {
+                    // FileController.Dispose flushes before closing; a failed flush must not retain a maintenance handle.
+                    if (!fc.IsDisposed)
+                        fc.Close();
+                }
+                finally
+                {
+                    try { fc.atomics.Dispose(); }
+                    finally
+                    {
+                        rootBuckets?.Tier.Dispose();
+                        if (bucketTiers is not null)
+                        {
+                            foreach (var tier in bucketTiers.Values)
+                                tier.tier.Tier.Dispose();
+                            bucketTiers.Clear();
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Fills one maintenance block, advancing through partial filesystem reads and rejecting unexpected EOF.<br/>
+        /// Uses the open controller's master handle under exclusive maintenance and retains syscall-read accounting without changing ordinary FileController reads.<br/>
+        /// </summary>
+        /// <param name="controller">Open source or replacement index controller.<br/></param>
+        /// <param name="bytes">Bounded stack or pooled block to fill completely.<br/></param>
+        /// <param name="offset">Validated physical start location.<br/></param>
+        private static void ReadMaintenanceExactly(FileController controller, Span<byte> bytes, ulong offset)
+        {
+            while (!bytes.IsEmpty)
+            {
+                controller.syscallPerfTracker.IncrementRead();
+                int read = RandomAccess.Read(controller.masterHandle, bytes, checked((long)offset));
+                if (read == 0)
+                    throw new EndOfStreamException("An index maintenance block ended before its validated extent.");
+                bytes = bytes.Slice(read);
+                offset = checked(offset + (uint)read);
+            }
         }
     }
 }

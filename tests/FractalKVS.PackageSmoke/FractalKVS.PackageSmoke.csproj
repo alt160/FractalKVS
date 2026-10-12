@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework Condition="'$(SmokeFramework)' == ''">net8.0</TargetFramework>
+    <TargetFramework Condition="'$(SmokeFramework)' != ''">$(SmokeFramework)</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <FractalKVSPackageVersion Condition="'$(FractalKVSPackageVersion)' == ''">1.0.1</FractalKVSPackageVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FractalKVS" Version="$(FractalKVSPackageVersion)" />
+  </ItemGroup>
+
+</Project>
