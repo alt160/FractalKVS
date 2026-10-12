@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     tags: ["v*.*.*"]
+    # Resume a failed publication without moving its immutable source tag.
+    branches: ["codex/release-v*.*.*"]
 
 permissions:
   contents: write
@@ -15,32 +17,46 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
+      - name: Derive immutable release tag
+        shell: bash
+        run: |
+          RELEASE_TAG="${GITHUB_REF_NAME#codex/release-}"
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected a stable release tag or codex/release-vX.Y.Z resume branch." >&2
+            exit 1
+          fi
+          echo "FRACTALKVS_RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "FRACTALKVS_PACKAGE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          ref: ${{ env.FRACTALKVS_RELEASE_TAG }}
 
       - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
 
-      - name: Derive version
-        shell: bash
+      - name: Verify source tag and project version
+        shell: pwsh
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "FRACTALKVS_PACKAGE_VERSION=$VERSION" >> "$GITHUB_ENV"
+          [xml] $project = Get-Content FractalKVS.csproj -Raw
+          if ([string] $project.Project.PropertyGroup.PackageVersion -cne $env:FRACTALKVS_PACKAGE_VERSION) {
+            throw 'The immutable source tag and project package version differ.'
+          }
 
       - name: Restore and build
         run: |
           dotnet restore FractalKVS.csproj
-          dotnet build FractalKVS.csproj --configuration Release --no-restore
+          dotnet build FractalKVS.csproj --configuration Release --no-restore /p:TreatWarningsAsErrors=true
 
       - name: Pack
         run: dotnet pack FractalKVS.csproj --configuration Release --no-build --output artifacts/packages /p:PackageVersion=${{ env.FRACTALKVS_PACKAGE_VERSION }}
 
       - name: Smoke test package consumer
         run: |
-          dotnet restore tests/FractalKVS.PackageSmoke/FractalKVS.PackageSmoke.csproj /p:RestoreAdditionalProjectSources=artifacts/packages /p:FractalKVSPackageVersion=${{ env.FRACTALKVS_PACKAGE_VERSION }}
-          dotnet run --project tests/FractalKVS.PackageSmoke/FractalKVS.PackageSmoke.csproj --configuration Release --no-restore /p:FractalKVSPackageVersion=${{ env.FRACTALKVS_PACKAGE_VERSION }}
+          dotnet build tests/FractalKVS.PackageSmoke/FractalKVS.PackageSmoke.csproj --configuration Release /p:RestoreAdditionalProjectSources=${{ github.workspace }}/artifacts/packages /p:FractalKVSPackageVersion=${{ env.FRACTALKVS_PACKAGE_VERSION }} /p:TreatWarningsAsErrors=true
+          dotnet tests/FractalKVS.PackageSmoke/bin/Release/net8.0/FractalKVS.PackageSmoke.dll
 
       - name: Create precompiled library archive and checksums
         shell: pwsh
@@ -70,4 +86,9 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" artifacts/packages/* --generate-notes --verify-tag
+        run: |
+          if gh release view "$FRACTALKVS_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$FRACTALKVS_RELEASE_TAG" artifacts/packages/* --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$FRACTALKVS_RELEASE_TAG" artifacts/packages/* --repo "$GITHUB_REPOSITORY" --generate-notes --verify-tag
+          fi
