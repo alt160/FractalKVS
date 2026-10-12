@@ -43,14 +43,15 @@ namespace FractalKVS
         //======  CONSTRUCTORS  ======
         public FData(string folderPath, string name, FractalStoreConfiguration config)
         {
-            var fifx = new FileInfo($"{folderPath}\\{name}.fractD");
+            string filePath = Path.Combine(folderPath, name + ".fractD");
+            var fifx = new FileInfo(filePath);
             if (!fifx.Exists)
                 if (config.CreateIfNotExists)
-                    fc = FileController.CreateOrOpen($"{folderPath}\\{name}.fractD", config.WriteBehavior);
+                    fc = FileController.CreateOrOpen(filePath, config.WriteBehavior);
                 else
                     throw new FileNotFoundException($"File '{fifx.FullName}' not found and config.CreateIfNotExists=false.");
             else
-                fc = FileController.Open($"{folderPath}\\{name}.fractD", config.WriteBehavior);
+                fc = FileController.Open(filePath, config.WriteBehavior);
 
             this.config = config;
         }

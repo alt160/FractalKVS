@@ -151,14 +151,18 @@ namespace FractalKVS
 
         //======  CONSTRUCTORS  ======
         /// <summary>
-        /// Defines one Fractal store family without opening its files.<br/>
-        /// Call <see cref="Open"/> before reading or writing records.<br/>
+        /// Acquires the data and index file controllers for one Fractal store family, creating missing files when configured.<br/>
+        /// Call <see cref="Open"/> to initialize the store before reading or writing records.<br/>
         /// </summary>
-        /// <param name="folderPath">Directory that contains the Fractal data and index files.<br/></param>
-        /// <param name="name">Base name shared by the store's files.<br/></param>
+        /// <param name="folderPath">Absolute or relative directory that contains the Fractal data and index files; relative paths resolve against the process's current directory.<br/></param>
+        /// <param name="name">Nonempty filename base shared by the store's files, without directory separators or a directory component.<br/></param>
         /// <param name="config">Creation, index-growth, concurrency, and durability configuration.<br/></param>
+        /// <exception cref="ArgumentException">The directory is blank or the store name is not a valid filename base.<br/></exception>
+        /// <exception cref="InvalidDataException">A legacy non-Windows backslash-named store member exists; explicitly migrate the offline store before opening it. No members are created or migrated by this rejection.<br/></exception>
         public FractalStore(string folderPath, string name, FractalStoreConfiguration config)
         {
+            ArgumentNullException.ThrowIfNull(config);
+            ValidateStoreLocation(folderPath, name);
             if (config.RootTierBucketCount.IsPowerOfTwo() == false)
                 throw new ArgumentException($"The {nameof(config.RootTierBucketCount)} value must be a power-of-2 value.");
 
@@ -2296,11 +2300,17 @@ namespace FractalKVS
         /// This rewrites only the stored path/name metadata and header checksums; no payload or index data is moved.<br/>
         /// Call on an offline store before <see cref="Open"/> when reclaiming a relocated copy.<br/>
         /// </summary>
+        /// <param name="folderPath">Absolute or relative directory containing the relocated store; relative paths resolve against the process's current directory.<br/></param>
+        /// <param name="name">Filename base shared by the store's files, without directory separators.<br/></param>
+        /// <param name="config">Configuration for opening the offline store.<br/></param>
+        /// <exception cref="ArgumentException">The directory is blank or the store name is not a valid filename base.<br/></exception>
+        /// <exception cref="InvalidDataException">A legacy non-Windows backslash-named member exists; this method does not move or migrate it.<br/></exception>
         public static void TakeOwnership(string folderPath, string name, FractalStoreConfiguration config)
         {
             if (config is null)
                 throw new ArgumentNullException(nameof(config));
 
+            ValidateStoreLocation(folderPath, name);
             var index = new FIndex(folderPath, name, config);
             var data = new FData(folderPath, name, config);
             try
@@ -4555,6 +4565,55 @@ namespace FractalKVS
             try { if (File.Exists(path)) File.Delete(path); }
             catch (IOException error) { Debug.WriteLine($"Fractal maintenance retained '{path}': {error.Message}"); }
             catch (UnauthorizedAccessException error) { Debug.WriteLine($"Fractal maintenance retained '{path}': {error.Message}"); }
+        }
+
+        /// <summary>
+        /// Validates the caller's store basename before any directory or store member can be created.<br/>
+        /// On non-Windows hosts, rejects members from the former literal-backslash layout, including orphaned coordination sidecars and ambiguous old/new pairs.<br/>
+        /// Checks the original spelling and both ordinary legacy directory-separator forms; never moves, deletes, opens, or adopts an existing member.<br/>
+        /// This is a cold construction/ownership check and adds no work to record read or write paths.<br/>
+        /// </summary>
+        /// <param name="folderPath">Caller-supplied absolute or relative storage directory.<br/></param>
+        /// <param name="name">Single filename base, without either platform's directory separators.<br/></param>
+        /// <exception cref="ArgumentException">An input is blank or the name is a directory, rooted path, or invalid filename.<br/></exception>
+        /// <exception cref="InvalidDataException">At least one legacy-named data, index, or coordination member exists.<br/></exception>
+        private static void ValidateStoreLocation(string folderPath, string name)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(folderPath);
+            ArgumentException.ThrowIfNullOrWhiteSpace(name);
+            if (name is "." or ".." || name.Contains('/') || name.Contains('\\') ||
+                Path.IsPathRooted(name) || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                throw new ArgumentException("The store name must be a filename base without directory separators or a directory component.", nameof(name));
+
+            if (OperatingSystem.IsWindows())
+                return;
+
+            string originalLegacyBase = folderPath + "\\" + name;
+            RejectLegacyStoreMembers(originalLegacyBase);
+            string fullDirectory = Path.GetFullPath(folderPath);
+            string siblingLegacyBase = Path.TrimEndingDirectorySeparator(fullDirectory) + "\\" + name;
+            if (!string.Equals(originalLegacyBase, siblingLegacyBase, StringComparison.Ordinal))
+                RejectLegacyStoreMembers(siblingLegacyBase);
+            string childLegacyBase = Path.Combine(fullDirectory, "\\" + name);
+            if (!string.Equals(originalLegacyBase, childLegacyBase, StringComparison.Ordinal) &&
+                !string.Equals(siblingLegacyBase, childLegacyBase, StringComparison.Ordinal))
+                RejectLegacyStoreMembers(childLegacyBase);
+        }
+
+        /// <summary>
+        /// Rejects a single legacy filename base if any primary or coordination member exists.<br/>
+        /// A partial legacy store is deliberately sufficient to block creation of a new, apparently empty canonical store.<br/>
+        /// </summary>
+        /// <param name="legacyBase">Exact legacy filename base, including its literal backslash.<br/></param>
+        /// <exception cref="InvalidDataException">A legacy store member exists and requires explicit offline migration.<br/></exception>
+        private static void RejectLegacyStoreMembers(string legacyBase)
+        {
+            if (File.Exists(legacyBase + ".fractX") || File.Exists(legacyBase + ".fractX.shm") ||
+                File.Exists(legacyBase + ".fractD") || File.Exists(legacyBase + ".fractD.shm"))
+                throw new InvalidDataException(
+                    $"Legacy backslash-named Fractal store members were found at '{legacyBase}.*'. " +
+                    "Explicit offline migration to platform-correct filenames and ownership metadata is required before opening this store. " +
+                    "No store files were created, moved, deleted, or adopted.");
         }
     }
 

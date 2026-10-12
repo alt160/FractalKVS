@@ -148,6 +148,8 @@ An update is represented through paired A/B locations in both the data mutation 
 
 Call `Open()` before normal operations and `Close()` when finished. Stores create a data file (`.fractD`), index file (`.fractX`), and coordination sidecars as needed.
 
+The store name is a filename base, not a path; pass its directory separately. Relative directories resolve against the process's current directory. Version 1.0.1 uses platform-correct file separators. On non-Windows systems, it rejects legacy backslash-named members from earlier builds before creating or adopting files, even when only a coordination sidecar remains. Such stores require explicit offline migration of their filenames and ownership metadata; opening a store never performs that migration automatically.
+
 - Use `Backup` for a store backup; observe its API requirements for the configured operating mode.
 - Use `RebuildIndex` only as an offline, exclusive maintenance operation on a healthy, open store. It reconstructs reachable index tiers while preserving A/B selections, back-references, record locations, store identity, and durable coordination state; it does not rewrite payloads or retune the routing shape. The original index is retained until the replacement reopens and validates. This operation requires the existing authoritative index and is not data-only recovery of a missing or corrupt `.fractX` file.
 - `StartOnlineDefrag` and `StopOnlineDefrag` control online space-reclamation work.

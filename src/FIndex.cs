@@ -215,18 +215,19 @@ namespace FractalKVS
         public FIndex(string folderPath, string name, FractalStoreConfiguration config)
         {
             this.config = config;
-            var fifx = new System.IO.FileInfo($"{folderPath}\\{name}.fractX");
+            string filePath = Path.Combine(folderPath, name + ".fractX");
+            var fifx = new System.IO.FileInfo(filePath);
             if (!fifx.Exists)
                 if (config.CreateIfNotExists)
                     fc = FileController.CreateOrOpen(
-                        $"{folderPath}\\{name}.fractX",
+                        filePath,
                         config.WriteBehavior,
                         FractalStore.CreatePersistedIndexAtomicSlotList());
                 else
                     throw new System.IO.FileNotFoundException($"File '{fifx.FullName}' not found and config.CreateIfNotExists=false.");
             else
                 fc = FileController.Open(
-                    $"{folderPath}\\{name}.fractX",
+                    filePath,
                     config.WriteBehavior,
                     FractalStore.CreatePersistedIndexAtomicSlotList());
         }

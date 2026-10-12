@@ -4,6 +4,7 @@ All notable changes to this project are documented in this file.
 
 ## 1.0.1 - 2026-10-12
 
+- Use platform-correct data/index paths and require a filename basename for the store name. On non-Windows hosts, reject legacy literal-backslash filenames before creating or adopting any store member; migration is explicit, never automatic.
 - Repair healthy-index maintenance: preserve reachable routing tiers, A/B selections, record locations, ownership and durable atomic state; validate before and after replacement, with rollback on failure.
 - Clarify that `RebuildIndex` requires a healthy authoritative index and exclusive offline access; it does not recover a missing/corrupt index by scanning physical payload history.
 - Add internal read-only snapshot validation for AbraxasDB backup/restore without adopting ownership or creating missing storage.
