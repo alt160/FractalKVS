@@ -1,8 +1,20 @@
 # FractalKVS
 
+[![NuGet](https://img.shields.io/nuget/v/FractalKVS.svg)](https://www.nuget.org/packages/FractalKVS)
+
 FractalKVS is a .NET-native, file-backed durable high-performance dictionary for `ulong` keys and binary values. It is for applications that need predictable, hash-directed lookup, large incrementally grown stores, concurrent reads and writes, and direct control over binary payloads—without a server, fixed store preallocation, a document model, or a query language.
 
 It is deliberately a storage engine, not a general-purpose database. FractalKVS keeps the application in charge of record identity, serialization, schema, and higher-level relationships.
+
+## Install
+
+Install the [FractalKVS NuGet package](https://www.nuget.org/packages/FractalKVS):
+
+```shell
+dotnet add package FractalKVS
+```
+
+FractalKVS targets .NET 8. Applications targeting compatible newer .NET versions, including .NET 9 and 10, can use the same library asset. NuGet restores its dependencies automatically.
 
 ## Why FractalKVS
 
